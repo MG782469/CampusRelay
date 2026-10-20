@@ -1,88 +1,105 @@
 # CampusRelay
 
-**CampusRelay turns a student's vague event request into a verified, human-approved campus workflow.**
+CampusRelay is a deterministic, evidence-first campus event workflow prototype. It turns a bounded natural-language event request into a human-approved booking in a **local synthetic campus reservation ledger**. It does not connect to a real university system.
 
-This is a focused Frontier Buildathon prototype for the **Agents & Automation** track. It uses a synthetic campus environment and makes no claim to submit to a real university system.
+## Implemented V2 workflow
 
-## Problem and users
+1. Create a request from a supported sentence format.
+2. Plan and validate event name, room, date, attendees, and optional start/end times.
+3. Submit the current plan for approval.
+4. Approve with one of the seeded synthetic advisors (`advisor-lee` / Dr. Lee or `advisor-patel` / Dr. Patel).
+5. Execute an atomic SQLite reservation after checking room existence, availability, capacity, and interval overlap.
+6. Read the reservation back from SQLite and only then mark the workflow completed.
+7. Display reservation, approval, operation, verification, and audit evidence in the browser.
 
-Student organization coordinators often move an event request between chat, a room-booking form, an advisor, and a separate confirmation email. Missing details are discovered late, approvals are hard to audit, and “done” often means only that someone sent a message.
+Conflicting requests receive deterministic available-room alternatives. CampusRelay never silently changes a student's room or time; a changed plan increments its plan version and invalidates the previous approval.
 
-CampusRelay is for student coordinators and the advisor/staff members who approve their events. It accepts a natural-language request, identifies missing intake data, creates a deterministic plan, enforces an advisor approval gate, runs a synthetic reservation tool, and records completion evidence.
+## Synthetic campus boundary
 
-## Why this is agentic
+The seeded rooms are local records only:
 
-The orchestrator performs a bounded workflow rather than answering a question: interpret intent, extract structured fields, plan steps, ask for missing information, enforce authorization, execute tools, recover from a simulated tool outage, and verify an observable result. Predictable policy checks are deterministic and testable offline; a future approved structured-output model can replace only the interpretation step.
+| Room | Building | Capacity | Equipment |
+|---|---|---:|---|
+| Student Union room 101 | Student Union | 40 | projector, whiteboard |
+| Library room 201 | Library | 80 | projector, hybrid camera |
+| Engineering room 301 | Engineering | 120 | projector, lab tables |
 
-## MVP workflow
+The campus timezone assumption is **UTC** for persisted timestamps; event dates and times are stored as the submitted local wall-clock values. This prototype has synthetic identities, not production authentication.
 
-1. Enter: “Book Student Union room 101 for the Robotics Club workshop on 2026-11-05 from 15:00 to 17:00 for 20 attendees; advisor Dr. Lee.”
-2. CampusRelay creates a plan and shows its state transitions.
-3. Missing information blocks submission instead of being invented.
-4. Only a payload with `role: advisor` can approve.
-5. Execution produces a synthetic reservation reference and completion evidence.
-6. A simulated tool failure is recorded as `failed` and can be safely retried.
+## Persistence schema
 
-## Architecture
+SQLite is used through Python's standard library. The database contains:
 
-```text
-Browser UI (index.html)
-        │ JSON over HTTP
-Python stdlib HTTP server (app.py)
-        ├── deterministic intent/field parser
-        ├── explicit request state machine
-        ├── approval and idempotency gates
-        ├── synthetic reservation tool + recovery path
-        └── audit log + evidence records
-```
+- `rooms`: room identity, building, capacity, availability, and equipment.
+- `advisors`: controlled demo advisor identities.
+- `requests`: request text, normalized plan, state, plan version, approval, audit, evidence, and reservation reference.
+- `reservations`: unique reservation ID, request ID, room, event name, date, time range, attendee count, status, operation ID, and creation timestamp.
+- `operations`: idempotency responses keyed by logical operation ID.
 
-State is in-memory by design for the demo. The synthetic campus boundary is explicit: `SYN-ROOM-2026-1105-101` is not a real reservation.
+The reservation transaction uses `BEGIN IMMEDIATE` and checks `start_time < existing_end AND end_time > existing_start`, so adjacent intervals are allowed while overlaps are rejected. `CAMPUSRELAY_DB` selects the database path; the default is an in-memory database for isolated development. Set it to a writable file for restart recovery.
+
+## API routes
+
+- `POST /api/requests` with `{ "text": "..." }`
+- `POST /api/requests/{id}/plan`
+- `POST /api/requests/{id}/submit`
+- `POST /api/requests/{id}/approve` with synthetic advisor identity and `role: "advisor"`
+- `POST /api/requests/{id}/execute` with optional stable `operation_id`
+- `GET /api/requests/{id}`
+- `GET /api/requests/{id}/alternatives`
+- `GET /api/rooms`
+- `GET /api/advisors`
+
+Execution is idempotent for a repeated operation ID and returns the existing ledger result instead of creating a second reservation. Completed workflows cannot be reopened or executed again.
 
 ## Run locally
 
-Requires Python 3.12 (see `.python-version`). No third-party packages are required.
+Requires Python 3.12, pinned in `.python-version`. No third-party packages are required.
 
 ```sh
+export CAMPUSRELAY_DB=./campusrelay.sqlite3
 python app.py
 # open http://localhost:8000
 ```
 
-## Test and Docker
+## Tests
 
-The single offline test command is:
+The reproducible offline command is:
 
 ```sh
 make test
 ```
 
-It runs six `unittest` cases covering the happy path, missing information, authorization, idempotent approval, tool failure/recovery, and completion evidence.
+The test suite uses temporary SQLite databases and covers the original six workflow contracts plus availability, overlap, adjacent intervals, capacity, unknown rooms, alternatives, approval invalidation, transition guards, idempotency, evidence, parser behavior, and restart persistence.
+
+`pytest` is not required or installed; use `make test` / `unittest` as documented.
+
+## Docker
+
+The image contains the pinned Python runtime and project files. The default command runs the offline suite:
 
 ```sh
 docker build -t campusrelay .
-docker run --rm -p 8000:8000 campusrelay
+docker run --rm campusrelay
 ```
 
-The Docker image runs the offline tests by default. To run the server in a container:
+To run the server with a writable mounted database:
 
 ```sh
-docker run --rm -p 8000:8000 --entrypoint python campusrelay app.py
+docker run --rm -p 8000:8000 -e CAMPUSRELAY_DB=/tmp/campusrelay.sqlite3 --entrypoint python campusrelay app.py
 ```
 
-## Research and differentiation
+## Reproducible demo
 
-Three candidate areas were compared before selection: hostel maintenance, placement eligibility, and student-event approvals. Maintenance products such as service-desk portals already cover ticket routing; placement systems already cover opportunity listings and eligibility; event tools cover room calendars and forms. The selected opportunity is the fragmented handoff **between** a natural-language student request, policy prerequisites, advisor approval, and verifiable room-booking evidence. CampusRelay is not a chatbot or another form: its distinctive MVP is a small, inspectable state machine with approval enforcement, failure recovery, and evidence-first closure.
+Use the browser's default request for Scenario A: plan, submit, approve as Dr. Lee, execute, and inspect the green evidence panel. For Scenario B, create another request for Student Union room 101 on `2026-11-05` from `15:00` to `17:00`; execution returns a conflict and lists Library room 201 as a suitable alternative. To demonstrate Scenario C, change the request explicitly to the suggested room, re-plan, submit, approve again, then execute. Repeating the same execution operation ID demonstrates Scenario D without a duplicate reservation.
 
-## Safety and limitations
+## Limitations
 
-- Synthetic data only; no real student records or institutional integrations.
-- No automatic impersonation or external communication.
-- Human approval is required before execution.
-- The parser is intentionally narrow and deterministic for reproducibility.
-- State is lost when the process stops; production would use authenticated users, durable storage, encrypted audit records, and real campus APIs with least-privilege scopes.
-
-## Buildathon disclosure
-
-Development was performed through the OmniRush coding workflow. The repository is prepared for public review, but publication, dashboard qualification, and final Unstop submission are separate actions and are not claimed here.
+- The parser intentionally supports a narrow deterministic format; ambiguous or missing input must be supplied explicitly.
+- Advisor identity is a controlled synthetic demo gate, not secure authentication.
+- No real university booking, calendar, email, or identity integration exists.
+- This prototype does not implement a distributed lock service; SQLite transaction locking is sufficient for its local single-database scope.
+- Reservations are synthetic and should not be represented as institutional confirmation.
 
 ## License
 
