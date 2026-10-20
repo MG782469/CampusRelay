@@ -1,1 +1,2 @@
-# Intentionally empty: CampusRelay uses only the Python 3.12 standard library.
+# Intentionally empty: no third-party packages; Python 3.12.15 standard library only.
+# Runtime pin: .python-version and Dockerfile. No pip install is necessary.

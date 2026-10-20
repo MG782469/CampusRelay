@@ -29,7 +29,7 @@ class CampusRelayV2Tests(unittest.TestCase):
         self.tmp.cleanup()
 
     def call(self, method, path, payload=None):
-        return handle_request(self.state, method, path, payload)
+        return handle_request(self.state, method, path, {} if payload is None else payload)
 
     def workflow(self, text=None, room=None, start="15:00", end="17:00", attendees=20):
         _, body = self.call("POST", "/api/requests", {"text": text or self.EVENT})
@@ -140,10 +140,11 @@ class CampusRelayContractTests(unittest.TestCase):
     )
 
     def setUp(self):
-        self.state = create_app_state()
+        self.state = create_app_state(":memory:")
+        self.addCleanup(self.state.close)
 
     def request(self, method, path, payload=None, expected_status=None):
-        result = handle_request(self.state, method, path, payload)
+        result = handle_request(self.state, method, path, {} if payload is None else payload)
         self.assertIsInstance(result, tuple, "handle_request must return (status, body)")
         self.assertEqual(len(result), 2)
         status, body = result
@@ -201,8 +202,10 @@ class CampusRelayContractTests(unittest.TestCase):
         self.assertEqual(status, 422)
         self.assertEqual(rejected["status"], "needs_information")
         self.assertIn("location", rejected["missing_fields"])
-        _, supplied = self.submit(request_id, {"location": "Student Union room 101"})
-        self.assertNotEqual(supplied["status"], "needs_information")
+        # V2 incorrectly allowed an executable submission without times/advisor.
+        self.submit(request_id, {"location": "Student Union room 101"}, expected_status=422)
+        _, supplied = self.submit(request_id, {"location": "Student Union room 101", "start_time": "15:00", "end_time": "17:00", "advisor": "Dr. Lee"})
+        self.assertEqual(supplied["status"], "pending_approval")
 
     def test_approval_requires_an_authorized_advisor(self):
         request_id = self.create_request()
