@@ -2,7 +2,7 @@
 
 CampusRelay is a deterministic, evidence-first campus event workflow prototype. It turns a bounded natural-language event request into a human-approved booking in a **local synthetic campus reservation ledger**. It does not connect to a real university system.
 
-## Implemented Milestone 1 workflow
+## Implemented V3 workflow foundation
 
 1. Create a request from a supported sentence format.
 2. Plan and validate all required fields: event name, room, date, start time, end time, attendees, and advisor.
@@ -12,7 +12,11 @@ CampusRelay is a deterministic, evidence-first campus event workflow prototype. 
 6. Read the reservation back from SQLite and only then mark the workflow completed.
 7. Display reservation, approval, operation, verification, and audit evidence in the browser.
 
-Conflicting requests receive deterministic available-room alternatives. CampusRelay never silently changes a student's room or time. Re-planning without a material change preserves the plan version and approval; material edits increment the version and invalidate approval.
+8. Evaluate the canonical SQLite room inventory and confirmed reservations with a deterministic, read-only constraint planner.
+9. Apply hard capacity, equipment, enabled-room, and interval constraints; rank feasible rooms using explicit preferences and stable tie-breaks.
+10. Expose structured candidates, facts, rejected-room reasons, flexible-time evaluation, and the recommended proposal without treating planning as authorization.
+
+Conflicting requests receive deterministic available-room alternatives. CampusRelay never silently changes a student's room or time. Re-planning without a material change preserves the plan version and approval; material edits increment the version and invalidate approval. Milestone 2 planning is a proposal only; Milestone 3 will add explicit same-workflow alternative selection and renewed approval.
 
 Attendance must be a strict positive integer (not a boolean, fraction, or coerced numeric string). Accepted times are normalized to `HH:MM` before comparison; start must precede end on the same date. Missing or invalid required fields block submission.
 
@@ -40,6 +44,8 @@ SQLite is used through Python's standard library. The database contains:
 - `reservations`: unique reservation ID, request ID, room, event name, date, time range, attendee count, status, operation ID, and creation timestamp.
 - `operations`: idempotency responses keyed by a global operation ID, with workflow/action/payload metadata for conflict detection.
 
+Planning is read-only and uses the same `rooms` and confirmed `reservations` tables. It does not persist a reservation or bypass approval. New request data may contain `required_equipment`, `preferred_room`, `preferred_building`, `advisor_required`, and an explicitly supplied `flexible_time_window`.
+
 Schema upgrades are additive: operation metadata and verification metadata support replay and recovery without destructively recreating existing tables or rewriting historical wall clocks. Verification evidence is recorded only after reading the committed reservation back. A workflow left in `verifying` after a committed reservation can recover by verifying that existing reservation instead of making a second booking.
 
 The reservation transaction uses `BEGIN IMMEDIATE` and checks `start_time < existing_end AND end_time > existing_start`, so adjacent intervals are allowed while overlaps are rejected. `CAMPUSRELAY_DB` selects the database path; the default is an in-memory database for isolated development. Set it to a writable file for restart recovery.
@@ -53,10 +59,11 @@ The reservation transaction uses `BEGIN IMMEDIATE` and checks `start_time < exis
 - `POST /api/requests/{id}/execute` with optional stable `operation_id`
 - `GET /api/requests/{id}`
 - `GET /api/requests/{id}/alternatives`
+- `GET /api/requests/{id}/plan` for a read-only structured planning proposal
 - `GET /api/rooms`
 - `GET /api/advisors`
 
-Operation keys are global, not scoped independently to each workflow or route. Repeating a key for the same workflow, action, and payload replays its recorded result; using it with a conflicting workflow, action, or payload is rejected. Successful execution replay does not create another reservation. Completed workflows cannot be reopened or freshly executed with a new key.
+Operation keys are global, not scoped independently to each workflow or route. Repeating a key for the same workflow, action, and payload replays its recorded result; using it with a conflicting workflow, action, actor, plan version, or payload is rejected. Successful execution replay does not create another reservation. Completed workflows cannot be reopened or freshly executed with a new key.
 
 ## Run locally
 
@@ -139,7 +146,9 @@ Use the browser's default request for Scenario A: plan, submit, approve as Dr. L
 
 ## Limitations
 
-- The parser intentionally supports a narrow deterministic format; ambiguous or missing input must be supplied explicitly.
+- The parser and planner intentionally support a bounded deterministic format; ambiguous or missing input produces clarification requirements rather than guesses.
+- Planning is deterministic constraint evaluation, not runtime LLM reasoning.
+- Equipment identifiers are limited to the seeded synthetic inventory (`projector`, `whiteboard`, `hybrid_camera`, and `lab_tables`).
 - Advisor identity is a spoofable synthetic demo gate, not secure authentication.
 - No LLM, real university booking, calendar, email, or identity integration exists.
 - This prototype does not implement a distributed lock service; SQLite transaction locking is sufficient for its local single-database scope.

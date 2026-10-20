@@ -10,7 +10,7 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     CAMPUSRELAY_DB=/data/campusrelay.sqlite3
 
 WORKDIR /app
-COPY app.py backend_integrity.py index.html Makefile requirements.lock .python-version ./
+COPY app.py backend_integrity.py planner.py index.html Makefile requirements.lock .python-version ./
 COPY tests/ ./tests/
 RUN mkdir -p /data
 

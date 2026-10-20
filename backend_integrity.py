@@ -16,9 +16,11 @@ from copy import deepcopy
 from datetime import date, datetime, time, timedelta, timezone
 from urllib.parse import urlparse
 
+from planner import normalize_planning_requirements, plan_request
+
 POLICY_ZONE = "UTC+05:30"
 POLICY_TZ = timezone(timedelta(hours=5, minutes=30))
-FIELDS = {"event_name", "location", "date", "attendees", "start_time", "end_time", "advisor"}
+FIELDS = {"event_name", "location", "date", "attendees", "start_time", "end_time", "advisor", "required_equipment", "preferred_room", "preferred_building", "advisor_required", "flexible_time_window"}
 REQUIRED = ("event_name", "location", "date", "attendees", "start_time", "end_time", "advisor")
 DATE_RE = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}\Z")
 TIME_RE = re.compile(r"([01]?[0-9]|2[0-3]):[0-5][0-9]\Z")
@@ -114,9 +116,22 @@ def parse(text):
     room = re.search(r"((?:student union|library|engineering)\s+room\s+[0-9]+|room\s+[0-9]+)", text, re.I)
     if room:
         data["location"] = room[1].strip()
+    preferred_room = re.search(r"(?:prefer|preferred room(?: is)?|preference is)\s+((?:student union|library|engineering)\s+room\s+[0-9]+|room\s+[0-9]+)", text, re.I)
+    if preferred_room:
+        data["preferred_room"] = preferred_room[1].strip()
+    preferred_building = re.search(r"(?:prefer|preferred)\s+(?:the\s+)?(student union|library|engineering)(?:\s+building)?\b", text, re.I)
+    if preferred_building:
+        data["preferred_building"] = preferred_building[1].strip()
+    equipment = []
+    for item, pattern in (("projector", r"\bprojector\b"), ("whiteboard", r"\bwhiteboard\b"), ("hybrid_camera", r"\bhybrid\s+camera\b"), ("lab_tables", r"\blab\s+tables?\b")):
+        if re.search(pattern, text, re.I) and re.search(r"(?:must|need|require|with|equipped|equipment)", text, re.I):
+            equipment.append(item)
+    if equipment:
+        data["required_equipment"] = equipment
     advisor = re.search(r"\b(advisor-(?:lee|patel)|Dr\.?\s+(?:Lee|Patel))\b", text, re.I)
     if advisor:
         data["advisor"] = advisor_id(advisor[1])
+        data["advisor_required"] = True
     event = re.search(r"(?:for|about)\s+(?:the\s+)?(.+?)(?:\s+on\s+[0-9]{4}|\s+at\s+|\s+workshop|\s+event|[.;]|$)", text, re.I)
     if event:
         data["event_name"] = event[1].strip().title()
@@ -131,6 +146,13 @@ def normalize(data):
         if key == "attendees":
             if type(value) is not int or value <= 0:
                 errors.append("attendees must be a positive integer")
+        elif key == "required_equipment":
+            continue
+        elif key == "advisor_required":
+            if type(value) is not bool:
+                errors.append("advisor_required must be a boolean")
+        elif key == "flexible_time_window":
+            continue
         elif not isinstance(value, str) or not value.strip():
             errors.append(f"{key} must be a nonempty string")
         else:
@@ -161,6 +183,14 @@ def normalize(data):
         else:
             out["advisor"] = "Dr. Lee" if resolved == "advisor-lee" else "Dr. Patel"
             out["advisor_id"] = resolved
+    planning_fields = {key: out[key] for key in ("event_name", "date", "start_time", "end_time", "attendees", "required_equipment", "preferred_room", "preferred_building", "advisor_required", "flexible_time_window") if key in out}
+    if out.get("advisor_id"):
+        planning_fields["assigned_advisor"] = out["advisor_id"]
+    planning, planning_errors = normalize_planning_requirements(planning_fields)
+    errors.extend(item["message"] for item in planning_errors)
+    for key in ("required_equipment", "preferred_room", "preferred_building", "advisor_required", "flexible_time_window"):
+        if key in planning:
+            out[key] = planning[key]
     out["timezone"] = POLICY_ZONE
     if not errors and all(out.get(key) for key in ("date", "start_time", "end_time")):
         for clock, stamp in (("start_time", "start_at"), ("end_time", "end_at")):
@@ -181,6 +211,15 @@ def schema(action, payload):
         if key in ("attendees", "plan_version"):
             if type(value) is not int or value < (1 if key == "attendees" else 0):
                 errors.append(f"{key} must be {'a positive' if key == 'attendees' else 'a nonnegative'} integer")
+        elif key == "required_equipment":
+            if type(value) is not list or any(not isinstance(item, str) or not item.strip() for item in value):
+                errors.append("required_equipment must be a list of nonempty strings")
+        elif key == "advisor_required":
+            if type(value) is not bool:
+                errors.append("advisor_required must be a boolean")
+        elif key == "flexible_time_window":
+            if type(value) is not dict:
+                errors.append("flexible_time_window must be an object")
         elif key == "simulate_failure":
             if type(value) is not bool:
                 errors.append("simulate_failure must be a boolean")
@@ -199,8 +238,6 @@ def schema(action, payload):
             if "advisor" in out and advisor_id(out["advisor"]) != advisor_id(out["advisor_id"]):
                 return None, ["advisor and advisor_id must identify the same advisor"]
             out["advisor"] = out.pop("advisor_id")
-        normalized, errors = normalize({key: value for key, value in out.items() if key in FIELDS})
-        out.update({key: value for key, value in normalized.items() if key in FIELDS})
     if action == "create" and not out.get("text"):
         errors.append("Describe the event you need to coordinate.")
     if action == "approve":
@@ -221,6 +258,21 @@ def steps(data):
 
 def booking_hash(req):
     return digest(req["data"])
+
+
+def planning_requirements(data):
+    requirements = {key: data[key] for key in ("event_name", "date", "start_time", "end_time", "attendees", "required_equipment", "preferred_building", "advisor_required", "flexible_time_window") if key in data}
+    if data.get("advisor_id"):
+        requirements["assigned_advisor"] = data["advisor_id"]
+    if data.get("preferred_room"):
+        requirements["preferred_room"] = data["preferred_room"]
+    elif data.get("location"):
+        requirements["preferred_room"] = data["location"]
+    return requirements
+
+
+def planning_result(state, req):
+    return plan_request(state, planning_requirements(req["data"]))
 
 
 def assigned_advisor(state, data):
@@ -253,15 +305,17 @@ def overlaps(state, room_id, data, exclude_request=None):
 
 
 def alternatives(state, data, exclude=None):
-    data, errors = normalize(data)
-    if errors or any(key not in data for key in ("date", "start_time", "end_time")):
+    normalized, errors = normalize(data)
+    if errors or any(key not in normalized for key in ("event_name", "date", "start_time", "end_time", "attendees")):
         return []
-    result = []
-    for room in state.conn.execute("SELECT * FROM rooms WHERE available=1 AND capacity>=? ORDER BY building,capacity,id", (data.get("attendees", 0),)):
-        if exclude in (room["id"], room["name"]) or overlaps(state, room["id"], data):
-            continue
-        result.append({**{key: room[key] for key in ("id", "name", "building", "capacity")}, "equipment": json.loads(room["equipment"])})
-    return result
+    requirements = {key: normalized[key] for key in ("event_name", "date", "start_time", "end_time", "attendees", "required_equipment", "preferred_building") if key in normalized}
+    requirements["preferred_room"] = normalized.get("preferred_room") or normalized.get("location")
+    result = plan_request(state, requirements)
+    return [
+        {"id": candidate["room_id"], **{key: candidate[key] for key in ("room_id", "name", "building", "capacity", "equipment", "equipment_match", "preference_matches", "reason_codes", "explanations", "selected_interval")}}
+        for candidate in result["feasible_plans"]
+        if exclude not in (candidate["room_id"], candidate["name"])
+    ]
 
 
 def operation_binding(req, action, payload):
@@ -305,7 +359,7 @@ def edit_plan(state, req, action, payload):
         return error(422, "Invalid event details.", req, validation_errors=errors)
     changed = data != req["data"]
     if action == "plan" and not changed and req["plan_version"] > 0:
-        return 200, public(req)
+        return 200, public(req) | {"planning": planning_result(state, req)}
     if changed or req["plan_version"] == 0:
         req["data"] = data
         req["plan_version"] += 1
@@ -328,7 +382,7 @@ def edit_plan(state, req, action, payload):
         req["status"] = "needs_information" if missing else "planned"
         record(req, "plan_created", "orchestrator", "Missing: " + (", ".join(missing) or "none"))
     save(state, req)
-    return 200, public(req)
+    return 200, public(req) | {"planning": planning_result(state, req)}
 
 
 def approve(state, req, payload):
@@ -364,6 +418,18 @@ def valid_approval(state, req):
     return bool(approval and advisor and approval.get("actor") == advisor["id"] and approval.get("plan_version") == req["plan_version"] and approval.get("plan_hash") == booking_hash(req))
 
 
+def selected_candidate(state, data):
+    requirements = planning_requirements(data)
+    room = room_for(state, data["location"])
+    if room is None:
+        requirements.pop("preferred_room", None)
+    result = plan_request(state, requirements)
+    if result["validation_errors"]:
+        return result, None
+    candidate = next((item for item in result["candidates"] if item["room_id"] == (room["id"] if room else None)), None)
+    return result, candidate
+
+
 def fault(state, phase):
     if state.fault_hook is not None:
         state.fault_hook(phase)
@@ -396,11 +462,16 @@ def prepare_execution(state, req, payload, binding, prior):
         record(req, "tool_failed", "reservation-tool", "Synthetic service unavailable before any reservation write")
         save(state, req)
         return error(502, "Synthetic reservation service failed.", req), False, False
+    planning, candidate = selected_candidate(state, data)
+    if planning["validation_errors"]:
+        return error(422, "Cannot execute invalid planning requirements.", req, validation_errors=planning["validation_errors"]), False, False
     room = room_for(state, data["location"])
-    if not room or not room["available"] or room["capacity"] < data["attendees"]:
-        return error(409, "Requested room is unavailable or too small.", req, alternatives=alternatives(state, data)), False, False
-    if overlaps(state, room["id"], data):
-        return error(409, "Requested room overlaps an existing reservation.", req, alternatives=alternatives(state, data, room["id"])), False, False
+    if not room or not candidate or not candidate["feasibility"]:
+        conflict = any(code == "confirmed_reservation_conflict" for code in (candidate or {}).get("hard_constraints_failed", []))
+        message = "Requested room overlaps an existing reservation." if conflict else "Requested room is unavailable or does not meet the required constraints."
+        return error(409, message, req, alternatives=alternatives(state, data, room["id"] if room else None), planning=planning), False, False
+    if candidate["selected_interval"]["start_time"] != data["start_time"] or candidate["selected_interval"]["end_time"] != data["end_time"]:
+        return error(409, "The available flexible interval requires a revised plan before execution.", req, alternatives=alternatives(state, data, room["id"]), planning=planning), False, False
     reservation_id = "res-" + uuid.uuid4().hex[:10]
     state.conn.execute("INSERT INTO reservations (id,request_id,room_id,event_name,event_date,start_time,end_time,attendees,status,operation_id,created_at,start_at,end_at,timezone,plan_hash,plan_version,booking_snapshot) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", (reservation_id, req["id"], room["id"], data["event_name"], data["date"], data["start_time"], data["end_time"], data["attendees"], "confirmed", binding["operation_id"], now(), data["start_at"], data["end_at"], data["timezone"], booking_hash(req), req["plan_version"], canonical(data)))
     req["status"] = "verifying"
@@ -497,6 +568,8 @@ def dispatch(state, method, route, payload):
             return error(404, "Request not found")
         if action is None:
             return 200, req
+        if action == "plan":
+            return 200, planning_result(state, req)
         if action == "alternatives":
             return 200, {"alternatives": alternatives(state, req["data"], req["data"].get("location"))}
         return error(405, "Method not allowed")
